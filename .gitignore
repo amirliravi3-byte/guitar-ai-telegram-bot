@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+output/
+downloads/
+*.wav
+*.mp3
+*.mid
+*.gp5
+*.png
+.env
