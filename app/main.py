@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from telegram_io import TelegramBot
 from analyze_song import analyze_audio, format_fa
 from demo_audio import render_demo
-from gp5_builder import build_arrangement_gp5, build_tab_from_midi
+from gp5_builder import build_arrangement_gp5, build_tab_from_midi, build_melody_gp5, write_melody_tab_txt
 from chord_diagram import draw_chord
 from callback import fetch_job, post_state
 from music_theory import normalize_chord, strumming_pattern, transpose_chord
@@ -87,12 +87,28 @@ def process_audio(args, bot, work):
     post_state(args.chat_id, result, args.job_id, args.user_id)
 
 
+def _video_mode(request_text: str):
+    t = (request_text or "").strip().lower()
+    rhythm_words = ("ریتم", "آکورد", "chord", "rhythm", "strum")
+    melody_words = ("ملودی", "تبلچر", "سولو", "melody", "lead", "solo", "tab")
+    wants_rhythm = any(w in t for w in rhythm_words)
+    wants_melody = any(w in t for w in melody_words)
+    if wants_rhythm and wants_melody:
+        return "both"
+    if wants_rhythm:
+        return "rhythm"
+    # Video defaults to melody/lead transcription. This matches the main use case
+    # and avoids silently returning a rhythm tab when no caption is present.
+    return "melody"
+
+
 def process_video(args, bot, work):
     src = work / ("input" + Path(args.file_name or "video.mp4").suffix)
     bot.download(args.file_id, src)
     wav = work / "video_audio.wav"
     convert_to_wav(src, wav)
     song_analysis = analyze_audio(str(wav))
+
     out_bp = work / "basic_pitch"
     out_bp.mkdir()
     run(["basic-pitch", str(out_bp), str(wav)])
@@ -100,26 +116,59 @@ def process_video(args, bot, work):
     if not mids:
         raise RuntimeError("Basic Pitch did not create MIDI.")
     midi = mids[0]
-    gp5 = work / "video_transcription.gp5"
-    build_tab_from_midi(str(midi), song_analysis.get("bpm", 120), str(gp5))
+
+    mode = _video_mode(args.request_text)
+    bpm = song_analysis.get("bpm", 120)
+    meter = song_analysis.get("meter_estimate", "4/4")
+
+    sent = []
+    if mode in ("melody", "both"):
+        melody_gp5 = work / "video_melody.gp5"
+        melody_txt = work / "video_melody_tab.txt"
+        events = build_melody_gp5(str(midi), bpm, meter, str(melody_gp5))
+        write_melody_tab_txt(events, str(melody_txt), title="Video melody / lead TAB")
+        bot.send_document(args.chat_id, str(melody_gp5), "🎸 Guitar Pro — ملودی/Lead")
+        bot.send_document(args.chat_id, str(melody_txt), "📝 تبلچر متنی ملودی")
+        sent.append("ملودی/Lead")
+
+    if mode in ("rhythm", "both"):
+        chords = song_analysis.get("progression") or []
+        if chords:
+            rhythm_gp5 = work / "video_rhythm_suggested.gp5"
+            # This is explicitly an accompaniment suggestion based on detected chords,
+            # not a claim that it is the exact strumming performed in the video.
+            build_arrangement_gp5(chords, bpm, meter, str(rhythm_gp5), style="strum", capo=0,
+                                  title="Suggested Rhythm Accompaniment")
+            bot.send_document(args.chat_id, str(rhythm_gp5), "🎵 Guitar Pro — همراهی ریتم پیشنهادی (بدون کاپو)")
+            sent.append("ریتم پیشنهادی")
+
+    bot.send_document(args.chat_id, str(midi), "🎹 MIDI خام Basic Pitch")
+
+    request_desc = args.request_text.strip() if args.request_text else "(بدون توضیح؛ پیش‌فرض=ملودی)"
     text = (
-        "🎥 تبدیل ویدیو به تبلچر\n"
-        f"تمپو تقریبی: {song_analysis.get('bpm')} BPM\n"
+        "🎥 پردازش ویدیو انجام شد\n"
+        f"درخواست: {request_desc}\n"
+        f"حالت اجرا: {mode}\n"
+        f"تمپو تقریبی: {bpm} BPM\n"
+        f"میزان تقریبی: {meter}\n"
         f"گام تقریبی: {song_analysis.get('key_estimate')}\n"
-        "فایل GP5 و MIDI پایین ارسال شدند.\n\n"
-        "ℹ️ Audio-to-MIDI روی اجرای تک‌ساز دقیق‌تر است؛ در ویدیوی دارای خواننده/درام/چند ساز، تبلچر حتماً با گوش بررسی شود."
+        f"خروجی: {', '.join(sent) if sent else 'MIDI خام'}\n\n"
+        "ℹ️ در حالت ملودی، فقط یک خط Lead پیوسته از نت‌های Basic Pitch انتخاب می‌شود؛ "
+        "نت‌های همزمان آکورد به زور داخل تبلچر ملودی ریخته نمی‌شوند."
     )
     bot.send_message(args.chat_id, text)
-    bot.send_document(args.chat_id, str(gp5), "🎸 Guitar Pro transcription")
-    bot.send_document(args.chat_id, str(midi), "🎹 MIDI transcription")
+
     state = {
         "source": "video",
-        "bpm": song_analysis.get("bpm"),
+        "bpm": bpm,
+        "meter_estimate": meter,
         "key_estimate": song_analysis.get("key_estimate"),
-        "last_gp5": "video_transcription.gp5",
+        "source_file_id": args.file_id,
+        "source_file_name": args.file_name,
+        "last_video_request": args.request_text,
+        "video_mode": mode,
     }
     post_state(args.chat_id, state, args.job_id, args.user_id)
-
 
 def process_artifact(args, bot, work):
     state = safe_json(args.context_json, {})
@@ -165,6 +214,7 @@ def namespace_from_job(job_id: str, job: dict):
         user_id=str(job.get("user_id", "")),
         file_id=str(job.get("file_id", "")),
         file_name=str(job.get("file_name", "")),
+        request_text=str(job.get("request_text", "")),
         artifact_type=str(job.get("artifact_type", "")),
         target=str(job.get("target", "")),
         context_json=job.get("context_json", {}) or {},
